@@ -539,8 +539,6 @@ class StaticSlidingWindowLayer(StaticLayer):
     def __init__(self, max_cache_len: int, sliding_window: int, **kwargs):
         effective_max_cache_len = min(sliding_window, max_cache_len)
         super().__init__(max_cache_len=effective_max_cache_len)
-        # Here, to avoid data-dependent control flows, we also need to use a python int to keep track of the cumulative length
-        self.cumulative_length_int = 0
         # This needs to be checked dynamically, as it's only True if we never go beyond the window
         self._is_croppable = max_cache_len <= sliding_window
 
@@ -562,34 +560,42 @@ class StaticSlidingWindowLayer(StaticLayer):
             self.lazy_initialization(key_states, value_states)
 
         kv_length = key_states.shape[-2]
-        current_length = self.cumulative_length_int
+
+        # Single-token decode path (the compiled path): keep all control flow in tensor ops using
+        # `self.cumulative_length` so Dynamo does not guard on a changing Python int and recompile every step.
+        if kv_length == 1:
+            is_full = self.cumulative_length >= self.max_cache_len
+            # Roll left by 1 only once the window is full; before that, keep slots in place and write at cumulative_length
+            new_keys = torch.where(is_full, self.keys.roll(-1, dims=-2), self.keys)
+            new_values = torch.where(is_full, self.values.roll(-1, dims=-2), self.values)
+            # Use a tensor index (see https://github.com/pytorch/pytorch/issues/159855)
+            cache_position = torch.clamp(self.cumulative_length, max=self.max_cache_len - 1).unsqueeze(0)
+            try:
+                new_keys.index_copy_(2, cache_position, key_states)
+                new_values.index_copy_(2, cache_position, value_states)
+            except NotImplementedError:
+                new_keys[:, :, cache_position] = key_states
+                new_values[:, :, cache_position] = value_states
+
+            # Copy back into `self` (do not just assign again) in order to keep the static dynamo address
+            self.keys.copy_(new_keys)
+            self.values.copy_(new_values)
+            self.cumulative_length.add_(1)
+
+            # Very important to return the `self` tensors here, as they have the static dynamo address
+            return self.keys, self.values
+
+        # Compiled multi-token path (e.g. assisted decoding verification) when the cache is guaranteed not to slide
+        if is_torchdynamo_compiling() and self._is_croppable:
+            return super().update(key_states, value_states, *args, **kwargs)
+
+        current_length = self.cumulative_length.item()
         is_full = current_length >= self.max_cache_len
-        # Update it now that we saved the value above
-        self.cumulative_length_int += kv_length
 
         if is_full:
-            # In general, we should use a much simpler `cat` here as well, independently of the states size. However,
-            # dynamo is currently bugged when doing it - see https://github.com/pytorch/pytorch/issues/159855 for more details
-            if key_states.shape[-2] == 1:
-                # Roll all values to the left by 1 position
-                new_keys = self.keys.roll(-1, dims=-2)
-                new_values = self.values.roll(-1, dims=-2)
-                # Overwrite the last position with new states
-                # (note: very important to use a tensor to index here, see https://github.com/pytorch/pytorch/issues/159855)
-                index = torch.tensor([-1], dtype=int, device=self.device)
-                new_keys[:, :, index] = key_states
-                new_values[:, :, index] = value_states
-
-                # Copy back into `self` (do not just assign again) in order to keep the static dynamo address
-                self.keys.copy_(new_keys)
-                self.values.copy_(new_values)
-
-                # Very important to return the `self` tensors here, as they have the static dynamo address
-                return self.keys, self.values
-            # Already full but using more than 1 new token (e.g. prefill caching, chat continuation, etc...)
-            else:
-                full_key_states = torch.cat((self.keys[:, :, 1:, :], key_states), dim=-2)
-                full_value_states = torch.cat((self.values[:, :, 1:, :], value_states), dim=-2)
+            # Already full with more than 1 new token (e.g. prefill caching, chat continuation, etc...)
+            full_key_states = torch.cat((self.keys[:, :, 1:, :], key_states), dim=-2)
+            full_value_states = torch.cat((self.values[:, :, 1:, :], value_states), dim=-2)
         # Not yet full, but becoming full on this update
         elif current_length + kv_length > self.max_cache_len:
             # Fast prefill path, no need to cat() in this case, as the cache is currently empty
@@ -600,63 +606,42 @@ class StaticSlidingWindowLayer(StaticLayer):
                 full_key_states = torch.cat((self.keys[:, :, :current_length, :], key_states), dim=-2)
                 full_value_states = torch.cat((self.values[:, :, :current_length, :], value_states), dim=-2)
         else:
-            # Note: very important to use the tensor version of the cumulative length here, as otherwise cudagraphs
-            # (triggered by mode="reduced_overhead") will lead to random crashes, as the int would be overwritten
-            cache_position = torch.arange(kv_length, device=self.device) + self.cumulative_length
-            try:
-                self.keys.index_copy_(2, cache_position, key_states)
-                self.values.index_copy_(2, cache_position, value_states)
-            except NotImplementedError:
-                self.keys[:, :, cache_position] = key_states
-                self.values[:, :, cache_position] = value_states
-
-            # Update the tensor version of the length in-place (we don't need to update it if we are already outside
-            # of this branch, as we don't need the tensor anymore)
-            self.cumulative_length.add_(kv_length)
-
-            # Very important to return the `self` tensors here, as they have the static dynamo address
-            return self.keys, self.values
+            return super().update(key_states, value_states, *args, **kwargs)
 
         # We only cache the last `sliding_window` tokens
         self.keys.copy_(full_key_states[:, :, -self.max_cache_len :, :])
         self.values.copy_(full_value_states[:, :, -self.max_cache_len :, :])
+        self.cumulative_length.add_(kv_length)
         # we should return the whole states instead of `self.keys/values` here, as otherwise we lose some context
         return full_key_states, full_value_states
 
-    def get_mask_sizes(self, query_length: int) -> tuple[int, int]:
+    def get_mask_sizes(self, query_length: int) -> tuple[int, int | torch.Tensor]:
         """Return the length and offset of the cache, used to generate the attention mask"""
         sliding_window = self.max_cache_len
-        is_full = self.cumulative_length_int >= self.max_cache_len
+        if query_length == 1:
+            # For single-token decode, kv_length is always `sliding_window`. Returning a tensor `kv_offset`
+            # avoids Dynamo constant-guarding on a Python int during compiled decoding.
+            kv_offset = torch.clamp(self.cumulative_length - sliding_window + 1, min=0) if self.is_initialized else 0
+            return sliding_window, kv_offset
 
-        kv_offset = max(self.cumulative_length_int - sliding_window + 1, 0)
+        if is_torchdynamo_compiling() and self._is_croppable:
+            return sliding_window, 0
+
+        current_length = self.cumulative_length.item() if self.is_initialized else 0
+        is_full = current_length >= self.max_cache_len
+
+        kv_offset = max(current_length - sliding_window + 1, 0)
         # The cache is already full
         if is_full:
             kv_length = sliding_window + query_length - 1
         # Not yet full, but becoming full on this update
-        elif self.cumulative_length_int + query_length > sliding_window:
-            kv_length = self.cumulative_length_int + query_length
+        elif current_length + query_length > sliding_window:
+            kv_length = current_length + query_length
         # Here the Cache is still smaller than the local size, but we return the local size as it's static
         else:
             kv_length = sliding_window
 
         return kv_length, kv_offset
-
-    def get_seq_length(self) -> int:
-        """Returns the sequence length of the cached states."""
-        return self.cumulative_length_int
-
-    def crop(self, tokens_to_remove: int) -> None:
-        """
-        Remove `tokens_to_remove` tokens from the current cache layer.
-        """
-        # Note that this is only correct as long as we never went beyond the window, which `is_croppable` guarantees - otherwise the
-        # evicted states cannot be recovered
-        super().crop(tokens_to_remove)
-        self.cumulative_length_int -= abs(tokens_to_remove)
-
-    def reset(self):
-        super().reset()
-        self.cumulative_length_int = 0
 
     @property
     def is_croppable(self) -> bool:

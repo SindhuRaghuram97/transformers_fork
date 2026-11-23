@@ -44,12 +44,14 @@ from transformers.utils import is_hqq_available, is_optimum_quanto_available, is
 
 if is_torch_available():
     import torch
+    import torch._dynamo.testing
 
     from transformers import (
         AutoModelForCausalLM,
         AutoTokenizer,
         Cache,
         CLIPVisionConfig,
+        CompileConfig,
         CTRLConfig,
         CTRLLMHeadModel,
         DynamicCache,
@@ -57,6 +59,7 @@ if is_torch_available():
         Ernie4_5_VLMoeForConditionalGeneration,
         Gemma2Config,
         Gemma3Config,
+        Gemma3ForCausalLM,
         Gemma3ForConditionalGeneration,
         Gemma3TextConfig,
         Gemma4Config,
@@ -100,6 +103,7 @@ if is_torch_available():
     from transformers.integrations.heterogeneity.configuration_utils import (
         AmbiguousGlobalPerLayerAttributeError,
     )
+    from transformers.masking_utils import create_sliding_window_causal_mask
 
 
 # FIXME: offloaded cache is skipped becase it needs `offload_only_non_sliding=False`
@@ -2318,6 +2322,135 @@ class SyntheticCacheTest(unittest.TestCase):
 
         self.assertEqual(cache.layers[0].keys[0, 0, :, 0].tolist(), [20.0, 30.0, 40.0])
         self.assertEqual(returned_1[0][0, 0, :, 0].tolist(), [10.0, 20.0, 30.0, 40.0])
+
+    @pytest.mark.torch_compile_test
+    def test_static_sliding_window_compile_no_recompiles(self):
+        """StaticSlidingWindowLayer must not recompile per decode step under torch.compile (even across window fill)."""
+        sliding_window = 4
+        max_cache_len = 20
+        torch.manual_seed(0)
+
+        static_layer = StaticSlidingWindowLayer(max_cache_len=max_cache_len, sliding_window=sliding_window)
+        dynamic_layer = DynamicSlidingWindowLayer(sliding_window=sliding_window)
+
+        # Prefill 2 tokens (< sliding_window) eagerly
+        k_prefill = torch.randn(1, 2, 2, 8)
+        v_prefill = torch.randn(1, 2, 2, 8)
+        static_layer.update(k_prefill, v_prefill)
+        dynamic_layer.update(k_prefill, v_prefill)
+
+        config = Gemma2Config(
+            vocab_size=64,
+            hidden_size=16,
+            intermediate_size=32,
+            num_hidden_layers=2,
+            num_attention_heads=2,
+            num_key_value_heads=2,
+            head_dim=8,
+            sliding_window=sliding_window,
+            attn_implementation="sdpa",
+        )
+        static_cache = StaticCache(config=config, max_cache_len=max_cache_len)
+        static_cache.layers[0] = static_layer
+
+        counter = torch._dynamo.testing.CompileCounter()
+
+        @torch.compile(backend=counter, fullgraph=True, dynamic=False)
+        def compiled_decode_step(k_step, v_step, embeds):
+            mask = create_sliding_window_causal_mask(
+                config=config,
+                inputs_embeds=embeds,
+                attention_mask=None,
+                cache=static_cache,
+                layer_idx=0,
+            )
+            k_out, v_out = static_layer.update(k_step, v_step)
+            return mask, k_out.clone(), v_out.clone()
+
+        torch.compiler.reset()
+        for _ in range(12):  # crosses sliding_window=4
+            k_step = torch.randn(1, 2, 1, 8)
+            v_step = torch.randn(1, 2, 1, 8)
+            embeds = torch.empty(1, 1, 16)
+
+            dyn_cache = DynamicCache(config=config)
+            dyn_cache.layers[0] = dynamic_layer
+            dyn_mask = create_sliding_window_causal_mask(
+                config=config,
+                inputs_embeds=embeds,
+                attention_mask=None,
+                cache=dyn_cache,
+                layer_idx=0,
+                allow_is_causal_skip=False,
+            )
+            dyn_k, dyn_v = dynamic_layer.update(k_step, v_step)
+            st_mask, st_k, st_v = compiled_decode_step(k_step, v_step, embeds)
+
+            self.assertEqual(static_layer.get_seq_length().item(), dynamic_layer.get_seq_length())
+            q = torch.randn(1, 2, 1, 8)
+            st_attn = torch.nn.functional.scaled_dot_product_attention(q, st_k, st_v, attn_mask=st_mask)
+            dyn_attn = torch.nn.functional.scaled_dot_product_attention(q, dyn_k, dyn_v, attn_mask=dyn_mask)
+            torch.testing.assert_close(st_attn, dyn_attn, atol=1e-5, rtol=1e-5)
+
+        self.assertEqual(counter.frame_count, 1)
+
+    @pytest.mark.torch_compile_test
+    def test_static_sliding_window_generate_compile_no_recompiles(self):
+        """Hybrid sliding-window generate() with StaticCache must compile once and match DynamicCache token-for-token."""
+        torch.manual_seed(42)
+        config = Gemma3TextConfig(
+            vocab_size=64,
+            hidden_size=32,
+            intermediate_size=64,
+            num_hidden_layers=2,
+            num_attention_heads=2,
+            num_key_value_heads=2,
+            head_dim=16,
+            sliding_window=4,
+            layer_types=["sliding_attention", "full_attention"],
+            attn_implementation="sdpa",
+        )
+        base_model = Gemma3ForCausalLM(config).eval()
+
+        cases = [
+            (torch.tensor([[1, 5]]), None),
+            (torch.tensor([[0, 0, 1, 5], [1, 7, 9, 11]]), torch.tensor([[0, 0, 1, 1], [1, 1, 1, 1]])),
+        ]
+
+        for input_ids, attention_mask in cases:
+            kwargs = {
+                "input_ids": input_ids,
+                "max_new_tokens": 14,
+                "min_new_tokens": 14,
+                "do_sample": False,
+                "pad_token_id": 0,
+            }
+            if attention_mask is not None:
+                kwargs["attention_mask"] = attention_mask
+
+            with torch.no_grad():
+                eager_out = base_model.generate(**kwargs, cache_implementation="dynamic")
+
+            compile_calls = []
+
+            def counting_backend(gm, example_inputs):
+                compile_calls.append(1)
+                return gm
+
+            compile_config = CompileConfig(backend=counting_backend, fullgraph=True, dynamic=False, mode=None)
+            compile_config._compile_all_devices = True
+
+            model = copy.deepcopy(base_model).eval()
+            torch.compiler.reset()
+            with torch.no_grad():
+                compiled_out = model.generate(
+                    **kwargs,
+                    cache_implementation="static",
+                    compile_config=compile_config,
+                )
+
+            self.assertEqual(len(compile_calls), 1)
+            torch.testing.assert_close(compiled_out, eager_out)
 
 
 ALL_DYNAMIC_LAYERS = (

@@ -219,27 +219,34 @@ def add_offsets_to_mask_function(mask_function: Callable, q_offset: int, kv_offs
     return inner_mask
 
 
-def prepare_padding_mask(attention_mask: torch.Tensor | None, kv_length: int, kv_offset: int) -> torch.Tensor | None:
+def prepare_padding_mask(
+    attention_mask: torch.Tensor | None, kv_length: int, kv_offset: int | torch.Tensor
+) -> torch.Tensor | None:
     """
     From the 2D attention mask, prepare the correct padding mask to use by potentially padding it.
     """
     local_padding_mask = attention_mask
     if attention_mask is not None:
+        offset = kv_offset.item() if isinstance(kv_offset, torch.Tensor) else kv_offset
         # Pad it if necessary
-        if (padding_length := kv_length + kv_offset - attention_mask.shape[-1]) > 0:
+        if (padding_length := kv_length + offset - attention_mask.shape[-1]) > 0:
             local_padding_mask = torch.nn.functional.pad(attention_mask, (0, padding_length))
     return local_padding_mask
 
 
 def maybe_pad_block_sequence_ids(
-    block_sequence_ids: torch.Tensor, attention_mask: torch.Tensor | None, kv_length: int, kv_offset: int
+    block_sequence_ids: torch.Tensor,
+    attention_mask: torch.Tensor | None,
+    kv_length: int,
+    kv_offset: int | torch.Tensor,
 ) -> torch.Tensor:
     """
     Pads the `block_sequence_ids` in case the total length is less than `kv_length`.
     Usually that happens with `StaticCache` generation or generating without cache.
     Pads to the right with `-1`.
     """
-    if (padding_length := kv_length + kv_offset - block_sequence_ids.shape[-1]) > 0:
+    offset = kv_offset.item() if isinstance(kv_offset, torch.Tensor) else kv_offset
+    if (padding_length := kv_length + offset - block_sequence_ids.shape[-1]) > 0:
         block_sequence_ids = F.pad(block_sequence_ids, pad=(0, padding_length), value=-1)
     return block_sequence_ids
 
@@ -279,8 +286,10 @@ def _ignore_causal_mask_sdpa(
     # never skipping while compiling.  # noqa: NC001, NC002
     if is_torchdynamo_exporting() or (padding_mask is not None and is_tracing(padding_mask)):
         return False
-    # Static caches use a tensor `q_offset` to avoid graph breaks, but reading it would cause one
-    if isinstance(q_offset, torch.Tensor) and is_tracing(q_offset):
+    # Static caches use tensor `q_offset` / `kv_offset` to avoid graph breaks, so reading them would cause one
+    if (isinstance(q_offset, torch.Tensor) and is_tracing(q_offset)) or (
+        isinstance(kv_offset, torch.Tensor) and is_tracing(kv_offset)
+    ):
         return False
     # In this case, we need to add special patterns to the mask no matter what, so we cannot use any of the later skip conditions
     if local_attention_size is not None and kv_length >= local_attention_size:
@@ -838,10 +847,11 @@ def _preprocess_mask_arguments(
     # If using a cache, it can give all information about mask sizes based on seen tokens
     if cache is not None:
         q_offset = cache.get_query_offset(layer_idx)
-        # To avoid graph breaks, StaticLayer returns a tensor instead of an int -> this has no impact on the ops, but
+        # To avoid graph breaks, static layers return tensors instead of ints -> this has no impact on the ops, but
         # we need the correct device
         q_offset = q_offset.to(inputs_embeds.device) if isinstance(q_offset, torch.Tensor) else q_offset
         kv_length, kv_offset = cache.get_mask_sizes(q_length, layer_idx)
+        kv_offset = kv_offset.to(inputs_embeds.device) if isinstance(kv_offset, torch.Tensor) else kv_offset
     # Otherwise, we infer based on our input
     else:
         q_offset = 0
